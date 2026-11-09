@@ -29,7 +29,7 @@ class NaverEngine(
     private var supabase: SupabaseClient? = null
     private var cdp: CdpClient? = null
     private val vpnMonitor = VpnMonitor { msg -> log(msg) }
-    private var lastVpnCheck = 0L
+    private var lastGateExitIp: String? = null
 
     val isRunning get() = running
 
@@ -129,16 +129,9 @@ class NaverEngine(
         log("  Admecca Worker 엔진 시작")
         log("  Worker: ${config.workerId}")
         log("  Chrome: $chromeVer (CDP)")
-        log("  VPN: ${if (vpnStatus.isHealthy) "ON" else "OFF"} | IP: ${vpnStatus.currentIp ?: "?"}")
+        log("  VPN: ${if (vpnStatus.isHealthy) "ON" else "OFF"} | IP: ${vpnStatus.currentIp ?: "?"} (${vpnStatus.exitCountry ?: "?"})")
         log("══════════════════════════════════")
-        if (!vpnStatus.isHealthy) {
-            log("[VPN] Surfshark VPN이 감지되지 않습니다 — 자동 연결 시도")
-            if (!vpnMonitor.ensureVpnConnected()) {
-                log("[VPN] 자동 연결 실패 — 수동으로 VPN을 켜주세요")
-                return
-            }
-        }
-        lastVpnCheck = System.currentTimeMillis()
+        // 연결·국가 검증은 아래 루프에서 슬롯 claim 직전마다 VPN 게이트가 수행한다(fail-closed).
 
         var totalRuns = 0
         var totalOk = 0
@@ -164,22 +157,19 @@ class NaverEngine(
                 heartbeatLast = System.currentTimeMillis()
             }
 
-            if (System.currentTimeMillis() - lastVpnCheck > 2 * 60 * 1000) {
-                val vpn = vpnMonitor.checkVpnStatus()
-                lastVpnCheck = System.currentTimeMillis()
-                if (vpn.ipChanged) {
-                    log("[VPN] IP 변경됨: ${vpn.currentIp}")
+            // VPN 게이트: 슬롯을 claim 하기 전에 판정한다 — 차단이면 리스를 태우지 않고 대기 후 재시도.
+            val gate = vpnMonitor.ensureTaskTrafficAllowed()
+            if (gate is VpnMonitor.Verdict.Blocked) {
+                log("[VPN-GATE] 트래픽 보류: ${gate.reason} — ${VPN_BLOCKED_WAIT_MS / 1000}초 후 재검문")
+                val waitUntil = System.currentTimeMillis() + VPN_BLOCKED_WAIT_MS
+                while (running && !stopping && System.currentTimeMillis() < waitUntil) {
+                    delay(1000)
                 }
-                if (!vpn.isHealthy) {
-                    log("[VPN] Surfshark VPN 꺼짐 감지 — 자동 재연결 시도")
-                    if (!vpnMonitor.ensureVpnConnected()) {
-                        log("[VPN] 재연결 실패 — 작업 중단")
-                        break
-                    }
-                }
-                if (vpn.ipStale) {
-                    log("[VPN] IP가 ${vpn.secondsSinceIpChange / 60}분간 변경 안됨 — VPN 자동 변경 확인 필요")
-                }
+                continue
+            }
+            if (gate is VpnMonitor.Verdict.Allowed && !gate.cached) {
+                if (gate.exitIp != lastGateExitIp) log("[VPN-GATE] KR 출구 확인: ${gate.exitIp ?: "?"}")
+                lastGateExitIp = gate.exitIp
             }
 
             log("슬롯 요청 중...")
@@ -226,6 +216,15 @@ class NaverEngine(
             }
 
             callback.onProgress(totalRuns, totalOk, totalFail)
+
+            // 출구 품질 신호 → 연속 임계 도달 시 다음 게이트 사이클에서 출구 교체.
+            val reason = result.failReason
+            vpnMonitor.onTaskExitQualityOutcome(
+                hadProtection = !result.success && reason in VpnMonitor.PROTECTION_FAIL_REASONS,
+                midFound = if (!result.success && reason in VpnMonitor.PRE_SEARCH_FAIL_REASONS) null
+                           else result.success || result.midFound,
+                detail = reason ?: ""
+            )
 
             if (totalRuns % 3 == 0) {
                 log("[청소] 쿠키/캐시 삭제 (${totalRuns}회차)")
@@ -679,5 +678,10 @@ class NaverEngine(
         cdp?.destroyBridge()
         cdp?.close()
         cdp = null
+    }
+
+    companion object {
+        /** VPN 게이트 차단 시 다음 재검문까지 대기 — 리스를 잡지 않은 채 쉰다. */
+        private const val VPN_BLOCKED_WAIT_MS = 30_000L
     }
 }
